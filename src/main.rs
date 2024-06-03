@@ -1,6 +1,6 @@
 use tcod::colors::*;
 use tcod::console::*;
-use tcod::input::Key;
+use tcod::input::{ self, Event, Key, Mouse };
 use tcod::input::KeyCode::*;
 use tcod::map::{ FovAlgorithm, Map as FovMap };
 use std::cmp;
@@ -11,11 +11,17 @@ const SCREEN_WIDTH: i32 = 80;
 const SCREEN_HEIGHT: i32 = 50;
 const LIMIT_FPS: i32 = 20; 
 const MAP_WIDTH: i32 = 80;
-const MAP_HEIGHT: i32 = 45;
+const MAP_HEIGHT: i32 = 43;
 const ROOM_MAX_SIZE: i32 = 10;
 const ROOM_MIN_SIZE: i32 = 6;
 const MAX_ROOMS: i32 = 30;
 const MAX_ROOM_MONSTERS: i32 = 3;
+const BAR_WIDTH: i32 = 20;
+const PANEL_HEIGHT: i32 = 7;
+const PANEL_Y: i32 = SCREEN_HEIGHT - PANEL_HEIGHT;
+const MSG_X: i32 = BAR_WIDTH + 2;
+const MSG_WIDTH: i32 = SCREEN_WIDTH - BAR_WIDTH - 2;
+const MSG_HEIGHT: usize = PANEL_HEIGHT as usize - 1;
 const COLOR_DARK_WALL: Color = Color { r: 0, g: 0, b: 100 };
 const COLOR_DARK_GROUND: Color = Color {
     r: 50,
@@ -41,13 +47,17 @@ type Map = Vec<Vec<Tile>>;
 
 struct Game {
     map: Map,
+    messages: Messages,
 }
 // implementing this to keep all tcod stuff togehter, 
 // saves having to refactor, and means we can pass it around easier. 
 struct Tcod {
     root: Root,
     con: Offscreen,
+    panel: Offscreen,
     fov: FovMap,
+    key: Key,
+    mouse: Mouse,
 }
 
 #[derive(Debug)]
@@ -100,29 +110,37 @@ impl Object {
         self.y = y;
     }
 
-    pub fn take_damage(&mut self, damage: i32) {
+    pub fn take_damage(&mut self, damage: i32, game: &mut Game) {
         // apply damage if possible
         if let Some(fighter) = self.fighter.as_mut() {
             if damage > 0 {
                 fighter.hp -= damage;
             }
         }
+        // check for death, call the death function
+        // Needs a seperate function because above is mutable so can't borrow after mutable borrow
+        if let Some(fighter) = self.fighter {
+            if fighter.hp <= 0 {
+                self.alive = false;
+                fighter.on_death.callback(self, game);
+            }
+        }
     }
     
-    pub fn attack(&mut self, target: &mut Object) {
+    pub fn attack(&mut self, target: &mut Object, game: &mut Game) {
         // a simple formula for attack damage
         let damage = self.fighter.map_or(0, |f| f.power) - target.fighter.map_or(0, |f| f.defense);
         if damage > 0 {
             // make the target take some damage
-            println!(
-                "{} attacks {} for {} hit points.",
-                self.name, target.name, damage
+            game.messages.add(
+                format!("{} attacks {} for {} hit points.", self.name, target.name, damage),
+                WHITE
             );
-            target.take_damage(damage);
+            target.take_damage(damage, game);
         } else {
-            println!(
-                "{} attacks {} but it has no effect!",
-                self.name, target.name
+            game.messages.add(
+                format!("{} attacks {} but it has no effect!", self.name, target.name), 
+                WHITE
             );
         }
     }
@@ -192,6 +210,11 @@ enum PlayerAction {
     Exit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeathCallback {
+    Player,
+    Monster,
+}
 // combat-related properties and methods (monster, player, NPC).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Fighter {
@@ -199,11 +222,43 @@ struct Fighter {
     hp: i32,
     defense: i32,
     power: i32,
+    on_death: DeathCallback,
+}
+
+impl DeathCallback {
+    fn callback(self, object: &mut Object, game: &mut Game) {
+        use DeathCallback::*;
+        let callback: fn(&mut Object, &mut Game) = match self {
+            Player => player_death,
+            Monster => monster_death,
+        };
+        callback(object, game);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Ai {
     Basic,
+}
+
+struct Messages {
+    messages: Vec<(String, Color)>,
+}
+
+impl Messages {
+    pub fn new() -> Self {
+        Self { messages: vec![] }
+    }
+
+    /// add the new message as a tuple, with the text and the color
+    pub fn add<T: Into<String>>(&mut self, message: T, color: Color) {
+        self.messages.push((message.into(), color));
+    }
+
+    /// Create a `DoubleEndedIterator` over the messages
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &(String, Color)> {
+        self.messages.iter()
+    }
 }
 
 fn main() {
@@ -221,7 +276,10 @@ fn main() {
     let mut tcod = Tcod { 
         root, 
         con: Offscreen::new(MAP_WIDTH, MAP_HEIGHT),
-        fov: FovMap::new(MAP_WIDTH, MAP_HEIGHT) 
+        panel: Offscreen::new(SCREEN_WIDTH, PANEL_HEIGHT),
+        fov: FovMap::new(MAP_WIDTH, MAP_HEIGHT),
+        key: Default::default(), // default sets to whatever type is considered default. Means we don't need to wrap in Option in case nothing is done
+        mouse: Default::default(),
     };
 
     // limits the refresh rate to LIMIT_FPS for frames per second. 
@@ -233,10 +291,14 @@ fn main() {
         hp: 30,
         defense: 2,
         power: 5,
+        on_death: DeathCallback::Player,
     });
+
     let mut objects = vec![player];
+    
     let mut game = Game { 
         map: make_map(&mut objects),
+        messages: Messages::new(),
     };
 
     // populate the FOV map, according to the generated map
@@ -251,23 +313,34 @@ fn main() {
         }
     }
 
+    game.messages.add(
+            "Welcome stranger! Prepare to perish in the Tombs of the Ancient Kings.",
+            RED,
+        );
+
     let mut previous_player_position: (i32, i32) = (-1, -1);
     
     // while checks that the window is still there
     while !tcod.root.window_closed() {
         tcod.con.clear();
-        tcod.con.set_default_foreground(WHITE);
+        // tcod.con.set_default_foreground(WHITE);
+
+        match input::check_for_event(input::MOUSE | input::KEY_PRESS) {
+            Some((_, Event::Mouse(m))) => tcod.mouse = m,
+            Some((_, Event::Key(k))) => tcod.key = k,
+            _ => tcod.key = Default::default(),
+        }
+
 
         let fov_recompute = previous_player_position != (objects[PLAYER].pos());
         render_all(&mut tcod, &mut game, &objects, fov_recompute);
 
         tcod.root.flush(); // This draws everything on the screen at once. 
-        tcod.root.wait_for_keypress(true);
         
         // handle keys and exit if needed 
         let player = &mut objects[0];
         previous_player_position = (player.x, player.y);
-        let player_action = handle_keys(&mut tcod, &game, &mut objects);
+        let player_action = handle_keys(&mut tcod, &mut game, &mut objects);
         
         if player_action == PlayerAction::Exit {
             break;
@@ -277,20 +350,19 @@ fn main() {
         if objects[PLAYER].alive && player_action != PlayerAction::DidntTakeTurn {
             for id in 0..objects.len() {
                 if objects[id].ai.is_some() {
-                    ai_take_turn(id, &tcod, &game, &mut objects);
+                    ai_take_turn(id, &tcod, &mut game, &mut objects);
                 }
             }
         }
     }
 }
 
-fn handle_keys(tcod: &mut Tcod, game: &Game, objects: &mut Vec<Object>) -> PlayerAction {
+fn handle_keys(tcod: &mut Tcod, game: &mut Game, objects: &mut Vec<Object>) -> PlayerAction {
     // import player actions here to reduce rekeying as all in small function.
     use PlayerAction::*;
-    // todo handle presses of keys
-    let key = tcod.root.wait_for_keypress(true);
     let player_alive = objects[PLAYER].alive;
-    match (key, key.text(), player_alive) {
+    
+    match (tcod.key, tcod.key.text(), player_alive) {
         (
             Key {
                 code: Enter,
@@ -335,8 +407,8 @@ fn make_map(objects: &mut Vec<Object>) -> Map {
         let w = rand::thread_rng().gen_range(ROOM_MIN_SIZE, ROOM_MAX_SIZE + 1);
         let h = rand::thread_rng().gen_range(ROOM_MIN_SIZE, ROOM_MAX_SIZE + 1);
         // random position without going out of the boundaries of the map
-        let x = rand::thread_rng().gen_range(0, MAP_WIDTH - w);
-        let y = rand::thread_rng().gen_range(0, MAP_HEIGHT - h);
+        let x = rand::thread_rng().gen_range(0, MAP_WIDTH - (w+1));
+        let y = rand::thread_rng().gen_range(0, MAP_HEIGHT - (h+1));
         let new_room = Rect::new(x, y, h, w);
 
         let failed = rooms
@@ -407,11 +479,83 @@ fn render_all(tcod: &mut Tcod, game: &mut Game, objects: &[Object], fov_recomput
                 tcod.con
                     .set_char_background(x, y, color, BackgroundFlag::Set);
             }
-            // tcod.con
-            //     .set_char_background(x, y, color, BackgroundFlag::Set);
+            
         }
     }
+    
+    let mut to_draw: Vec<_> = objects
+        .iter()
+        .filter(|o| tcod.fov.is_in_fov(o.x, o.y))
+        .collect();
+    // sort so that non-blocking objects come first
+    to_draw.sort_by(|o1, o2| o1.blocks.cmp(&o2.blocks));
+    // draw the objects in the list
+    for object in &to_draw {
+        object.draw(&mut tcod.con);
+    }
 
+    // show player stats
+    tcod.root.set_default_foreground(WHITE);
+    if let Some(fighter) = objects[PLAYER].fighter {
+        tcod.root.print_ex(
+            1,
+            SCREEN_HEIGHT - 2,
+            BackgroundFlag::None,
+            TextAlignment::Left,
+            format!("HP: {}/{} ", fighter.hp, fighter.max_hp),
+        );
+    }
+    // prepare to render the GUI panel
+    tcod.panel.set_default_background(BLACK);
+    tcod.panel.clear();
+
+    // show the player's stats
+    let hp = objects[PLAYER].fighter.map_or(0, |f| f.hp);
+    let max_hp = objects[PLAYER].fighter.map_or(0, |f| f.max_hp);
+    render_bar(
+        &mut tcod.panel,
+        1,
+        1,
+        BAR_WIDTH,
+        "HP",
+        hp,
+        max_hp,
+        LIGHT_RED,
+        DARKER_RED,
+    );
+
+    // display names of objects under the mouse
+    tcod.panel.set_default_foreground(LIGHT_GREY);
+    tcod.panel.print_ex(
+        1,
+        0,
+        BackgroundFlag::None,
+        TextAlignment::Left,
+        get_names_under_mouse(tcod.mouse, objects, &tcod.fov),
+    );
+
+    // print the game messages, one line at a time
+    let mut y = MSG_HEIGHT as i32;
+    for &(ref msg, color) in game.messages.iter().rev() {
+        let msg_height = tcod.panel.get_height_rect(MSG_X, y, MSG_WIDTH, 0, msg);
+        y -= msg_height;
+        if y < 0 {
+            break;
+        }
+        tcod.panel.set_default_foreground(color);
+        tcod.panel.print_rect(MSG_X, y, MSG_WIDTH, 0, msg);
+    }
+
+    // blit the contents of `panel` to the root console
+    blit(
+        &tcod.panel,
+        (0, 0),
+        (SCREEN_WIDTH, PANEL_HEIGHT),
+        &mut tcod.root,
+        (0, PANEL_Y),
+        1.0,
+        1.0,
+    );
     // blit copies an area of pixels to another. 
     // Here we are going from 0,0 to W, H
     blit(
@@ -471,6 +615,7 @@ fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
                     hp: 10,
                     defense: 0,
                     power: 3,
+                    on_death: DeathCallback::Monster,
                 });
                 orc.ai = Some(Ai::Basic);
                 orc
@@ -482,6 +627,7 @@ fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
                     hp: 16,
                     defense: 1,
                     power: 4,
+                    on_death: DeathCallback::Monster,
                 });
                 troll.ai = Some(Ai::Basic);
                 troll
@@ -503,21 +649,21 @@ fn is_blocked(x: i32, y: i32, map: &Map, objects: &[Object]) -> bool {
         .any(|object| object.blocks && object.pos() == (x, y))
 }
 
-fn player_move_or_attack(dx: i32, dy: i32, game: &Game, objects: &mut [Object]) {
+fn player_move_or_attack(dx: i32, dy: i32, game: &mut Game, objects: &mut [Object]) {
     // the coordinates the player is moving to/attacking
     let x = objects[PLAYER].x + dx;
     let y = objects[PLAYER].y + dy;
 
     // try to find an attackable object there
-    let target_id = objects.iter().position(|object| object.pos() == (x, y));
+    let target_id = objects
+        .iter()
+        .position(|object| object.fighter.is_some() && object.pos() == (x, y));
 
     // attack if target found, move otherwise
     match target_id {
         Some(target_id) => {
-            println!(
-                "The {} laughs at your puny efforts to attack him!",
-                objects[target_id].name
-            );
+            let (player, target) = mut_two(PLAYER, target_id, objects);
+            player.attack(target, game);  
         }
         None => {
             move_by(PLAYER, dx, dy, &game.map, objects);
@@ -546,7 +692,7 @@ fn move_towards(id: usize, target_x: i32, target_y: i32, map: &Map, objects: &mu
     move_by(id, dx, dy, map, objects);
 }
 
-fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &Game, objects: &mut [Object]) {
+fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &mut Game, objects: &mut [Object]) {
     // a basic monster takes its turn. If you can see it, it can see you
     let (monster_x, monster_y) = objects[monster_id].pos();
     if tcod.fov.is_in_fov(monster_x, monster_y) {
@@ -556,12 +702,92 @@ fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &Game, objects: &mut [Obje
             move_towards(monster_id, player_x, player_y, &game.map, objects);
         } else if objects[PLAYER].fighter.map_or(false, |f| f.hp > 0) {
             // close enough, attack! (if the player is still alive.)
-            let monster = &objects[monster_id];
-            println!(
-                "The attack of the {} bounces off your shiny metal armor!",
-                monster.name
-            );
+            let (monster, player) = mut_two(monster_id, PLAYER, objects);
+            monster.attack(player, game);
         }
     }
 }
 
+// Mutably borrow two *separate* elements from the given slice.
+// Panics when the indexes are equal or out of bounds.
+// Rust doesn't know if borrowing 2 mutable values from a list that they are not the same 
+
+fn mut_two<T>(first_index: usize, second_index: usize, items: &mut [T]) -> (&mut T, &mut T) {
+    assert!(first_index != second_index);
+    let split_at_index = cmp::max(first_index, second_index);
+    let (first_slice, second_slice) = items.split_at_mut(split_at_index);
+    if first_index < second_index {
+        (&mut first_slice[first_index], &mut second_slice[0])
+    } else {
+        (&mut second_slice[0], &mut first_slice[second_index])
+    }
+}
+
+fn player_death(player: &mut Object, game: &mut Game) {
+    // the game ended!
+    game.messages.add("You died!", RED);
+
+    // for added effect, transform the player into a corpse!
+    player.char = '%';
+    player.color = DARK_RED;
+}
+
+fn monster_death(monster: &mut Object, game: &mut Game) {
+    // transform it into a nasty corpse! it doesn't block, can't be
+    // attacked and doesn't move
+    game.messages.add(format!("{} is dead!", monster.name), ORANGE);
+    monster.char = '%';
+    monster.color = DARK_RED;
+    monster.blocks = false;
+    monster.fighter = None;
+    monster.ai = None;
+    monster.name = format!("remains of {}", monster.name);
+}
+
+fn render_bar(
+    panel: &mut Offscreen,
+    x: i32,
+    y: i32,
+    total_width: i32,
+    name: &str,
+    value: i32,
+    maximum: i32,
+    bar_color: Color,
+    back_color: Color,
+) {
+    // render a bar (HP, experience, etc). First calculate the width of the bar
+    let bar_width = (value as f32 / maximum as f32 * total_width as f32) as i32;
+
+    // render the background first
+    panel.set_default_background(back_color);
+    panel.rect(x, y, total_width, 1, false, BackgroundFlag::Screen);
+
+    // now render the bar on top
+    panel.set_default_background(bar_color);
+    if bar_width > 0 {
+        panel.rect(x, y, bar_width, 1, false, BackgroundFlag::Screen);
+    }
+    // finally, some centered text with the values
+    panel.set_default_foreground(WHITE);
+    panel.print_ex(
+        x + total_width / 2,
+        y,
+        BackgroundFlag::None,
+        TextAlignment::Center,
+        &format!("{}: {}/{}", name, value, maximum),
+    );
+}
+
+/// return a string with the names of all objects under the mouse
+fn get_names_under_mouse(mouse: Mouse, objects: &[Object], fov_map: &FovMap) -> String {
+    let (x, y) = (mouse.cx as i32, mouse.cy as i32);
+
+    // create a list with the names of all objects at the mouse's coordinates and in FOV
+    let names = objects
+        .iter()
+        .filter(|obj| obj.pos() == (x, y) && fov_map.is_in_fov(obj.x, obj.y))
+        .map(|obj| obj.name.clone())
+        .collect::<Vec<_>>();
+
+    names.join(", ") // join the names, separated by commas
+}
